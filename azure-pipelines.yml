@@ -1,0 +1,359 @@
+# Terraform pipeline
+
+trigger:
+  - main
+parameters:
+  - name: destoryTerraform 
+    displayName: "Destory Terraform Infrastrcture?"
+    default: No
+    values:
+    - Yes
+    - No
+variables:
+  - name: tf_version
+    value: "latest" # what version of terraform should be used
+  - name: tf_state_rg
+    value: "rg-tfbackend" # name of the resource group to create/use for the terraform state file
+  - name: tz_state_location
+    value: "uksouth" # location of the resource group to create/use for the terraform state file
+  - name: tf_state_sku
+    value: "Standard_LRS" # sku to use when creating the storeage account to create/use for the terraform state file
+  - name: tf_state_sa_name
+    value: "tfbackendsacc" # name of of the storage account to create/use for the terraform state file
+  - name: tf_state_container_name
+    value: "tfstate" # name of of the container to create/use for the terraform state file
+  - name: tf_environment
+    value: "dev" # enviroment name, used for the statefile name
+  - name: resourceGroup
+    value: "rg-terraform"
+  - name: team
+    value: "team"
+  - name: tf_state_tags
+    value: ("env=dev" "deployedBy=devops")
+  - name: DefaultWorkingDirectory
+    value: $(System.DefaultWorkingDirectory)/Terraform
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  # Run TFSec, upload results and optionally halt if there any problems found
+  ######################################################################
+
+  - stage: "QualityCheckStage"
+    displayName: "Quality Check Stage"
+    jobs:
+      - job: "QualityTestJob"
+        displayName: "Run TFSec"
+        steps:
+          - bash: |
+              mkdir TFSecReport
+              docker pull liamg/tfsec:latest
+              docker run --rm -t -v $(DefaultWorkingDirectory):/src liamg/tfsec ./src --format JUnit > $(DefaultWorkingDirectory)/TFSecReport/junit.xml
+            workingDirectory: $(DefaultWorkingDirectory)
+            displayName: "TFSec Static Code Analysis"
+          - task: PublishTestResults@2
+            inputs:
+              testRunTitle: "TFSecReport Results"
+              failTaskOnFailedTests: false
+              publishRunAttachments: true
+              mergeTestResults: false
+              testResultsFormat: "JUnit"
+              testResultsFiles: "**/junit.xml"
+              searchFolder: "$(DefaultWorkingDirectory)/TFSecReport"
+            displayName: "Publish TFSecReport Test results"
+
+  # Validate Terraform - uses the following ...
+  # https://marketplace.visualstudio.com/items?itemName=charleszipp.azure-pipelines-tasks-terraform
+  ######################################################################
+  - stage: "azureCLIJob"
+    displayName: "Azure CLI Storage Creation"
+    # dependsOn:
+    #  - "QualityCheckStage"
+    jobs:
+      - job: "azureCLIJob"
+        displayName: "Azure CLI Create Storage"
+        continueOnError: false
+        steps:
+        - task: AzureCLI@2
+          displayName: "Create or check the terraform state file Azure storage account"
+          inputs:
+            azureSubscription: "$(SUBSCRIPTION_NAME)"
+            addSpnToEnvironment: true
+            scriptType: "bash"
+            scriptLocation: "inlineScript"
+            inlineScript: |
+              TAGS=$(tf_state_tags)
+              az group create --name $(tf_state_rg) --location $(tz_state_location) --tags "${TAGS[@]}"
+              az storage account create --resource-group $(tf_state_rg) --name $(tf_state_sa_name) --sku $(tf_state_sku) --encryption-services blob --tags "${TAGS[@]}"
+              ACCOUNT_KEY=$(az storage account keys list --resource-group $(tf_state_rg) --account-name $(tf_state_sa_name) --query [0].value -o tsv)
+              az storage container create --name $(tf_state_container_name) --account-name $(tf_state_sa_name) --account-key $ACCOUNT_KEY
+              echo "##vso[task.setvariable variable=tf_state_sa_key]$ACCOUNT_KEY"
+
+  - stage: "validateTerraform"
+    displayName: "Validate Terraform"
+    dependsOn:
+      - "azureCLIJob"
+    condition: |
+      and
+        (
+          succeeded(),
+          eq('${{ parameters.destoryTerraform }}', 'No')
+        )
+    jobs:
+      - job: "TerraformJobs"
+        displayName: "Terraform > install, init and validate"
+        continueOnError: false
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: "$(tf_version)"
+            displayName: "Install Terraform"
+          - task: TerraformCLI@0
+            inputs:
+              command: "init"
+              workingDirectory: $(DefaultWorkingDirectory)
+              backendType: "azurerm"
+              backendServiceArm: "$(SUBSCRIPTION_NAME)"
+              ensureBackend: true
+              backendAzureRmResourceGroupName: "$(tf_state_rg)"
+              backendAzureRmResourceGroupLocation: "$(tz_state_location)"
+              backendAzureRmStorageAccountName: "$(tf_state_sa_name)"
+              backendAzureRmStorageAccountSku: "$(tf_state_sku)"
+              backendAzureRmContainerName: $(tf_state_container_name)
+              backendAzureRmKey: "$(tf_environment).terraform.tstate"
+            displayName: "Initialise Terraform"
+
+          - task: TerraformCLI@0
+            inputs:
+              command: "validate"
+              workingDirectory: $(DefaultWorkingDirectory)
+              environmentServiceName: "$(SUBSCRIPTION_NAME)"
+            displayName: "Terraform Validate"
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.8'
+            displayName: 'Install Python 3.8'
+          - script: pip install bridgecrew
+            displayName: 'Install the Bridgecrew CLI'
+          - script: bridgecrew -d $(DefaultWorkingDirectory) --bc-api-key $(BRIDGECREWTOKEN) --repo-id $(REPOSITORYID) --branch master
+            displayName: 'Scan with Bridgecrew'
+
+  # Plan Terraform - uses the following ...
+  # https://marketplace.visualstudio.com/items?itemName=charleszipp.azure-pipelines-tasks-terraform
+  # Will set some variables to trigger a terrafrom apply automatically
+  # if there are just changes or ask for approval if there are any
+  # resouces which are being destroyed
+  ######################################################################
+
+  - stage: "planTerraform"
+    displayName: "Plan Terraform"
+    dependsOn:
+      - "validateTerraform"
+    jobs:
+      - job: "TerraformJobs"
+        displayName: "Terraform > install, init & apply"
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: "$(tf_version)"
+            displayName: "Install Terraform"
+          - task: TerraformCLI@0
+            inputs:
+              command: 'init'
+              workingDirectory: '$(DefaultWorkingDirectory)'
+              backendType: 'azurerm'
+              backendServiceArm: '$(SUBSCRIPTION_NAME)'
+              ensureBackend: true
+              backendAzureRmResourceGroupName: '$(tf_state_rg)'
+              backendAzureRmResourceGroupLocation: '$(tz_state_location)'
+              backendAzureRmStorageAccountName: '$(tf_state_sa_name)'
+              backendAzureRmStorageAccountSku: '$(tf_state_sku)'
+              backendAzureRmContainerName: '$(tf_state_container_name)'
+              backendAzureRmKey: '$(tf_environment).terraform.tstate'
+              allowTelemetryCollection: true
+            displayName: "Initialise Terraform"
+          - task: TerraformCLI@0
+            inputs:
+              command: "plan"
+              workingDirectory: '$(DefaultWorkingDirectory)'
+              environmentServiceName: "$(SUBSCRIPTION_NAME)"
+              publishPlanResults: "PlanResults"
+              commandOptions: "-var=resource_group_name=$(resourceGroup) -var=environment=$(tf_environment) -var=team=$(team) -var=location=$(tz_state_location) -out=$(DefaultWorkingDirectory)/terraform.tfplan -detailed-exitcode"
+
+            name: "plan"
+            displayName: "Plan Terraform"
+
+          - task: TerraformCLI@0
+            inputs:
+              command: 'show'
+              workingDirectory: '$(DefaultWorkingDirectory)'
+              allowTelemetryCollection: true
+              inputTargetPlanOrStateFilePath: '$(DefaultWorkingDirectory)/terraform.tfplan'
+            displayName: "Show Terraform"
+
+          - bash: |
+              if [ "$TERRAFORM_PLAN_HAS_CHANGES" = true ] && [ "$TERRAFORM_PLAN_HAS_DESTROY_CHANGES" = false ] ; then
+                echo "##vso[task.setvariable variable=HAS_CHANGES_ONLY;isOutput=true]true"
+                echo "##vso[task.logissue type=warning]Changes with no destroys detected, it is safe for the pipeline to proceed automatically"
+                fi
+
+              if [ "$TERRAFORM_PLAN_HAS_CHANGES" = true ] && [ "$TERRAFORM_PLAN_HAS_DESTROY_CHANGES" = true ] ; then
+                echo "##vso[task.setvariable variable=HAS_DESTROY_CHANGES;isOutput=true]true"
+                echo "##vso[task.logissue type=warning]Changes with Destroy detected, pipeline will require a manual approval to proceed"
+
+                fi
+              if [ "$TERRAFORM_PLAN_HAS_CHANGES" != true ] ; then
+                echo "##vso[task.logissue type=warning]No changes detected, terraform apply will not run"
+              fi
+            name: "setvar"
+            displayName: "Vars > Set Variables for next stage"
+
+  # Auto Approval Terraform - uses the following ...
+  # https://marketplace.visualstudio.com/items?itemName=charleszipp.azure-pipelines-tasks-terraform
+  # Will run the terraform apply if there are are only changes and
+  # nothing to be destroyed
+  ######################################################################
+
+  - stage: "autoTerraform"
+    displayName: "Terraform Auto Approval"
+    dependsOn:
+      - "planTerraform"
+    condition: |
+      and
+        (
+          succeeded(),
+          eq(dependencies.planTerraform.outputs['TerraformJobs.setvar.HAS_CHANGES_ONLY'], 'true')
+        )
+    jobs:
+      - job: "TerraformAuto"
+        displayName: "Terraform > install, init & apply"
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: "$(tf_version)"
+            displayName: "Install Terraform"
+          - task: TerraformCLI@0
+            inputs:
+              command: "init"
+              backendType: "azurerm"
+              backendServiceArm: "$(SUBSCRIPTION_NAME)"
+              ensureBackend: true
+              workingDirectory: $(DefaultWorkingDirectory)
+              backendAzureRmResourceGroupName: "$(tf_state_rg)"
+              backendAzureRmResourceGroupLocation: "$(tz_state_location)"
+              backendAzureRmStorageAccountName: "$(tf_state_sa_name)"
+              backendAzureRmStorageAccountSku: "$(tf_state_sku)"
+              backendAzureRmContainerName: $(tf_state_container_name)
+              backendAzureRmKey: "$(tf_environment).terraform.tstate"
+            displayName: "Initialise Terraform"
+          - task: TerraformCLI@0
+            inputs:
+              command: 'apply'
+              workingDirectory: '$(DefaultWorkingDirectory)'
+              environmentServiceName: '$(SUBSCRIPTION_NAME)'
+              allowTelemetryCollection: true
+            displayName: "Apply Terraform"
+
+  # Manual Approval Terraform - uses the following ...
+  # https://marketplace.visualstudio.com/items?itemName=charleszipp.azure-pipelines-tasks-terraform
+  # Will wait for changes to be approved if there are any resources
+  # which are  being destroyed
+  ######################################################################
+
+  - stage: "approveTerraform"
+    displayName: "Terraform Manual Approval"
+    dependsOn:
+      - "planTerraform"
+    condition: |
+      and
+        (
+          succeeded(),
+          eq(dependencies.planTerraform.outputs['TerraformJobs.setvar.HAS_DESTROY_CHANGES'], 'true')
+        )
+    jobs:
+      - job: "waitForValidation"
+        displayName: "Wait for manual appoval"
+        pool: "server"
+        timeoutInMinutes: "4320" # job times out in 3 days
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440 # task times out in 1 day
+            inputs:
+              notifyUsers: |
+                $(NOTIFYUSER)
+              instructions: "There are resources being destroyed as part of this deployment, please review the output of Terraform plan before approving."
+              onTimeout: "reject"
+
+      - job: "TerraformApprove"
+        displayName: "Terraform Apply"
+        dependsOn: "waitForValidation"
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: "$(tf_version)"
+            displayName: "Install Terraform"
+          - task: TerraformCLI@0
+            inputs:
+              command: 'init'
+              workingDirectory: '$(DefaultWorkingDirectory)'
+              backendType: 'azurerm'
+              backendServiceArm: '$(SUBSCRIPTION_NAME)'
+              ensureBackend: true
+              backendAzureRmResourceGroupName: '$(tf_state_rg)'
+              backendAzureRmResourceGroupLocation: '$(tz_state_location)'
+              backendAzureRmStorageAccountName: '$(tf_state_sa_name)'
+              backendAzureRmStorageAccountSku: '$(tf_state_sku)'
+              backendAzureRmContainerName: '$(tf_state_container_name)'
+              backendAzureRmKey: '$(tf_environment).terraform.tstate'
+              allowTelemetryCollection: true
+            displayName: "Initialise Terraform"
+
+          - task: TerraformCLI@0
+            inputs:
+              command: 'apply'
+              workingDirectory: '$(DefaultWorkingDirectory)'
+              environmentServiceName: '$(SUBSCRIPTION_NAME)'
+              allowTelemetryCollection: true
+            displayName: "Apply Terraform"
+
+  - stage: "destroyTerraform"
+    displayName: "Destroy Terraform"
+    dependsOn:
+      - "azureCLIJob"
+    condition: |
+      and
+        (
+          succeeded(),
+           eq('${{ parameters.destoryTerraform }}', 'Yes')
+        )
+    jobs:
+      - job: "TerraformJobs"
+        displayName: "Terraform > install, init and destroy"
+        continueOnError: false
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: "$(tf_version)"
+            displayName: "Install Terraform"
+          - task: TerraformCLI@0
+            inputs:
+              command: "init"
+              workingDirectory: $(DefaultWorkingDirectory)
+              backendType: "azurerm"
+              backendServiceArm: "$(SUBSCRIPTION_NAME)"
+              ensureBackend: true
+              backendAzureRmResourceGroupName: "$(tf_state_rg)"
+              backendAzureRmResourceGroupLocation: "$(tz_state_location)"
+              backendAzureRmStorageAccountName: "$(tf_state_sa_name)"
+              backendAzureRmStorageAccountSku: "$(tf_state_sku)"
+              backendAzureRmContainerName: $(tf_state_container_name)
+              backendAzureRmKey: "$(tf_environment).terraform.tstate"
+            displayName: "Initialise Terraform"
+
+          - task: TerraformCLI@0
+            inputs:
+              command: "destroy"
+              workingDirectory: $(DefaultWorkingDirectory)
+              environmentServiceName: "$(SUBSCRIPTION_NAME)"
+            displayName: "Terraform Destroy"
